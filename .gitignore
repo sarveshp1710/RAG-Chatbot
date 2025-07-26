@@ -1,0 +1,23 @@
+# Virtual Environment
+# Ignore the entire virtual environment folder
+rag_env/
+
+# Documents
+# Do not commit the provided PDF/Word documents
+documents/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code specific
+.vscode/
+
+# Qdrant local storage (if any created in the project folder)
+qdrant_storage/
+
+# Any local data or logs
+*.log
+local_data/
