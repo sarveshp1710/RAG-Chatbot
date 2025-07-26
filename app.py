@@ -2,7 +2,12 @@ import streamlit as st
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
+import fitz  # PyMuPDF
+import docx
+import uuid
+import nltk
+import io
 
 # Import configuration from our config.py file
 from config import (
@@ -10,73 +15,136 @@ from config import (
     LLM_MODEL_NAME,
     QDRANT_HOST,
     QDRANT_PORT,
-    QDRANT_COLLECTION_NAME
+    QDRANT_COLLECTION_NAME,
+    CHUNK_SIZE
 )
 
 # --- MODEL AND CLIENT LOADING ---
 
-# The @st.cache_resource decorator ensures this function runs only once,
-# caching the models in memory for performance.
 @st.cache_resource
 def load_models_and_clients():
-    """
-    Load all required models and database clients and cache them.
-    This function will only run once, on the first run of the app.
-    """
+    """Load all required models and database clients and cache them."""
     print("Loading models and clients for GPU...")
-    
-    # Load the embedding model from Sentence Transformers, placing it on the GPU
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
-    
-    # Load the LLM tokenizer and model from Hugging Face
     tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, use_fast=True)
     llm_model = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL_NAME,
-        device_map="auto", # Automatically select the device (GPU)
-        torch_dtype=torch.float16, # Use float16 for memory efficiency
-        trust_remote_code=False # Set to False for security unless required by model
+        device_map="auto",
+        torch_dtype=torch.float16,
+        trust_remote_code=False
     )
-    
-    # Initialize the client to connect to our Qdrant database
     qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    
     print("Models and clients loaded successfully.")
     return embedding_model, tokenizer, llm_model, qdrant_client
 
-# --- CORE RAG LOGIC ---
+# --- DOCUMENT PROCESSING LOGIC ---
+
+def process_documents(uploaded_files, qdrant_client, embedding_model):
+    """Loads, chunks, embeds, and indexes the content of uploaded files."""
+    if not uploaded_files:
+        st.warning("Please upload some documents first.")
+        return
+
+    with st.spinner("Processing documents... This may take a while."):
+        # Ensure the 'punkt' tokenizer is downloaded for sentence splitting
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except nltk.downloader.DownloadError:
+            nltk.download('punkt')
+
+        # Clear the old collection in Qdrant to start fresh
+        qdrant_client.recreate_collection(
+            collection_name=QDRANT_COLLECTION_NAME,
+            vectors_config=models.VectorParams(
+                size=embedding_model.get_sentence_embedding_dimension(),
+                distance=models.Distance.COSINE
+            ),
+        )
+
+        all_chunks_text = []
+        all_chunks_meta = []
+
+        for uploaded_file in uploaded_files:
+            file_name = uploaded_file.name
+            st.write(f"Processing {file_name}...")
+            
+            # Read file content into memory
+            file_bytes = uploaded_file.read()
+            text = ""
+            if file_name.endswith(".pdf"):
+                with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                    text = "".join(page.get_text() for page in doc)
+            elif file_name.endswith(".docx"):
+                with io.BytesIO(file_bytes) as doc_stream:
+                    doc = docx.Document(doc_stream)
+                    text = "\n".join([para.text for para in doc.paragraphs])
+
+            # Chunking logic using NLTK
+            sentences = nltk.sent_tokenize(text)
+            current_chunk = ""
+            for sentence in sentences:
+                if len(current_chunk) + len(sentence) + 1 <= CHUNK_SIZE:
+                    current_chunk += " " + sentence
+                else:
+                    if current_chunk:
+                        all_chunks_text.append(current_chunk.strip())
+                        all_chunks_meta.append({"file_name": file_name})
+                    current_chunk = sentence
+            if current_chunk:
+                all_chunks_text.append(current_chunk.strip())
+                all_chunks_meta.append({"file_name": file_name})
+
+        st.write(f"Created {len(all_chunks_text)} chunks. Now embedding...")
+
+        # Embed all chunks at once
+        chunk_embeddings = embedding_model.encode(all_chunks_text, show_progress_bar=True)
+        
+        # Upload to Qdrant
+        chunk_ids = [str(uuid.uuid4()) for _ in all_chunks_text]
+        qdrant_client.upload_points(
+            collection_name=QDRANT_COLLECTION_NAME,
+            points=[
+                models.PointStruct(
+                    id=chunk_id,
+                    vector=vector.tolist(),
+                    payload={
+                        "file_name": meta["file_name"],
+                        "content": text_chunk,
+                        "chunk_id": chunk_id
+                    }
+                )
+                for chunk_id, vector, text_chunk, meta in zip(chunk_ids, chunk_embeddings, all_chunks_text, all_chunks_meta)
+            ],
+            wait=True
+        )
+    st.success("Documents processed and indexed successfully!")
+    return True
+
+# --- RAG AND CHAT LOGIC ---
 
 def get_answer(query, embedding_model, tokenizer, llm_model, qdrant_client):
-    """
-    Performs the entire RAG pipeline to get an answer for the user query.
-    """
-    # 1. Embed the user's query into a vector
+    """Performs the RAG pipeline to get an answer for the user query."""
     query_vector = embedding_model.encode(query).tolist()
-    
-    # 2. Search Qdrant for relevant context (the "Retrieval" part)
     search_results = qdrant_client.search(
         collection_name=QDRANT_COLLECTION_NAME,
         query_vector=query_vector,
-        limit=3  # Retrieve the top 3 most relevant chunks
+        limit=3
     )
     
-    # 3. Format the retrieved context for the LLM
     context = ""
     for result in search_results:
-        # Include the source metadata in the context for the LLM to see
-        context += f"Source: {result.payload['file_name']}, Page: {result.payload['page_number']}, Chunk ID: {result.payload['chunk_id']}\n"
+        context += f"Source: {result.payload['file_name']}, Chunk ID: {result.payload['chunk_id']}\n"
         context += f"Content: {result.payload['content']}\n---\n"
         
     if not context:
         return "Sorry, I could not find any relevant information in the documents."
 
-    # 4. Create the detailed prompt for the LLM (the "Augmented" part)
     prompt_template = """
 INSTRUCTION: You are a helpful assistant. Your task is to answer the user's question based ONLY on the context provided below.
 - If the context contains the answer, provide the answer.
-- After the answer, on a new line, cite the exact source using the format: SOURCE: [filename], Page: [page_number], Chunk ID: [chunk_id].
-- You MUST use the metadata from the specific chunk that contains the answer for the citation.
-- If you cannot find the answer in the context, you MUST respond with "I could not find the answer in the provided documents."
-- Do not use any external knowledge or make up information.
+- After the answer, on a new line, cite the exact source using the format: SOURCE: [filename], Chunk ID: [chunk_id].
+- If you cannot find the answer, respond with "I could not find the answer in the provided documents."
+- Do not use any external knowledge.
 
 CONTEXT:
 {context}
@@ -86,69 +154,64 @@ QUESTION:
 
 ANSWER:
 """
-    
     final_prompt = prompt_template.format(context=context, query=query)
-    
-    # 5. Generate the answer using the LLM (the "Generation" part)
-    # Tokenize the prompt and send it to the GPU
     inputs = tokenizer(final_prompt, return_tensors="pt", return_attention_mask=False).to("cuda")
     
-    # Generate text without tracking gradients for efficiency
     with torch.no_grad():
         outputs = llm_model.generate(**inputs, max_new_tokens=512)
     
-    # Decode the generated tokens back into a string
     response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Extract only the answer part from the full generated text
-    # The model's output includes the original prompt, so we find where the "ANSWER:" part ends.
     answer_start_index = response_text.find("ANSWER:")
     if answer_start_index != -1:
-        answer = response_text[answer_start_index + len("ANSWER:"):].strip()
-    else:
-        # Fallback if the model doesn't follow the format perfectly
-        answer = "Could not parse the model's response. The model generated:\n" + response_text
-
-    return answer
-
+        return response_text[answer_start_index + len("ANSWER:"):].strip()
+    return "Could not parse the model's response."
 
 # --- STREAMLIT UI SETUP ---
 
-st.set_page_config(page_title="RAG Hackathon Chatbot", layout="wide")
-st.title("📄 Document-based RAG Chatbot (GPU Version)")
-st.write("This chatbot answers questions based only on the documents provided for the hackathon.")
+st.set_page_config(page_title="Dynamic RAG Chatbot", layout="wide")
+st.title("📄 Dynamic Document Chatbot")
 
-# Load models and clients once on app startup
+# Load models and clients
 try:
     embedding_model, tokenizer, llm_model, qdrant_client = load_models_and_clients()
-    st.success("Models loaded successfully!")
 except Exception as e:
     st.error(f"Failed to load models: {e}")
     st.stop()
 
+# Sidebar for file upload
+with st.sidebar:
+    st.header("1. Upload Documents")
+    uploaded_files = st.file_uploader(
+        "Upload your PDF or Word documents",
+        type=["pdf", "docx"],
+        accept_multiple_files=True
+    )
+    if st.button("Process Documents") and uploaded_files:
+        st.session_state.documents_processed = process_documents(
+            uploaded_files, qdrant_client, embedding_model
+        )
 
-# Initialize chat history in session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# Main chat interface
+st.header("2. Chat with Your Documents")
 
-# Display chat messages from history on app rerun
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+if st.session_state.get("documents_processed", False):
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-# Accept user input
-if prompt := st.chat_input("Ask a question about your documents"):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    # Display user message in chat message container
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    # Display assistant response in chat message container
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        with st.spinner("Finding an answer..."):
-            full_response = get_answer(prompt, embedding_model, tokenizer, llm_model, qdrant_client)
-            message_placeholder.markdown(full_response)
-    # Add assistant response to chat history
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    if prompt := st.chat_input("Ask a question about your documents"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            with st.spinner("Finding an answer..."):
+                full_response = get_answer(prompt, embedding_model, tokenizer, llm_model, qdrant_client)
+                message_placeholder.markdown(full_response)
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+else:
+    st.info("Please upload and process your documents in the sidebar to begin.")
