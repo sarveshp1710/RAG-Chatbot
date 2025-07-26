@@ -7,8 +7,8 @@ import uuid
 import nltk
 import io
 
-# --- CACHE DIRECTORY SETUP ---
-# This ensures models are downloaded to your E: drive.
+# --- CACHE SETUP ---
+# Set the cache directory to ensure models are downloaded to your E: drive.
 CACHE_DIR = "E:/huggingface_cache"
 os.environ["HF_HOME"] = CACHE_DIR
 os.environ["SENTENCE_TRANSFORMERS_HOME"] = CACHE_DIR
@@ -36,22 +36,19 @@ from config import (
 @st.cache_resource
 def load_models_and_clients():
     """Load all required models and database clients and cache them."""
-    print("Loading models and clients for GPU (GGUF)...")
+    print("Loading models and clients for CPU...")
     
-    # Load the embedding model, placing it on the GPU
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
+    # Load the embedding model onto the CPU
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
     
     # Download the GGUF model file from Hugging Face Hub if it doesn't exist
     model_path = hf_hub_download(repo_id=LLM_MODEL_NAME, filename=LLM_MODEL_FILE)
 
-    # Load the GGUF model using ctransformers, configured for GPU offloading
-    # The number of layers to offload depends on your VRAM. 50 is a high number
-    # suitable for GPUs with >12GB VRAM. If you get an out-of-memory error,
-    # reduce this number (e.g., to 20 or 30).
+    # Load the GGUF model using ctransformers, configured to run on the CPU.
+    # The gpu_layers parameter is removed.
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_path,
         model_type="mistral",
-        gpu_layers=50,  # Offload 50 layers to the GPU
         context_length=4096 
     )
     
@@ -70,11 +67,11 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
         return
 
     with st.spinner("Processing documents... This may take a while."):
-        # Ensure the 'punkt' tokenizer is downloaded for sentence splitting
-        try:
-            nltk.data.find('tokenizers/punkt')
-        except nltk.downloader.DownloadError:
-            nltk.download('punkt')
+        # --- THE FIX IS HERE ---
+        # This command is idempotent: it will only download the 'punkt' data
+        # if it's missing, otherwise it does nothing. This is more robust
+        # than the try/except block.
+        nltk.download('punkt')
 
         # Clear the old collection in Qdrant to start fresh
         qdrant_client.recreate_collection(
@@ -190,7 +187,7 @@ QUESTION:
 # --- STREAMLIT UI SETUP ---
 
 st.set_page_config(page_title="Dynamic RAG Chatbot", layout="wide")
-st.title("📄 Dynamic Document Chatbot (GPU Version)")
+st.title("📄 Dynamic Document Chatbot (CPU Version)")
 
 try:
     embedding_model, llm_model, qdrant_client = load_models_and_clients()
@@ -227,7 +224,7 @@ if st.session_state.get("documents_processed", False):
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            with st.spinner("Finding an answer..."):
+            with st.spinner("Finding an answer... (This may be slow on CPU)"):
                 full_response = get_answer(prompt, embedding_model, llm_model, qdrant_client)
                 message_placeholder.markdown(full_response)
         st.session_state.messages.append({"role": "assistant", "content": full_response})
