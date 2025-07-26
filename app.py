@@ -1,7 +1,10 @@
 import os
 import streamlit as st
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+# --- THE FIX IS HERE ---
+# We now import the specialized loader directly from the auto_gptq library
+from transformers import AutoTokenizer
+from auto_gptq import AutoGPTQForCausalLM
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient, models
 import fitz  # PyMuPDF
@@ -36,15 +39,21 @@ from config import (
 @st.cache_resource
 def load_models_and_clients():
     """Load all required models and database clients and cache them."""
-    print("Loading models and clients for GPU...")
+    print("Loading models and clients for GPU using AutoGPTQ...")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
     tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, use_fast=True)
-    llm_model = AutoModelForCausalLM.from_pretrained(
+    
+    # --- THE FIX IS HERE ---
+    # We now use AutoGPTQForCausalLM.from_quantized, which is the specialized
+    # loader for GPTQ models. This is more reliable.
+    llm_model = AutoGPTQForCausalLM.from_quantized(
         LLM_MODEL_NAME,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        trust_remote_code=False
+        device="cuda:0", # Explicitly specify the GPU device
+        use_safetensors=True,
+        trust_remote_code=True,
+        use_triton=False # Triton is another optimization that can sometimes cause issues
     )
+    
     qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     print("Models and clients loaded successfully.")
     return embedding_model, tokenizer, llm_model, qdrant_client
@@ -167,12 +176,16 @@ QUESTION:
 ANSWER:
 """
     final_prompt = prompt_template.format(context=context, query=query)
-    inputs = tokenizer(final_prompt, return_tensors="pt", return_attention_mask=False).to("cuda")
+    # The AutoGPTQ model requires a different input format for generation
+    # We pass the tokenized prompt directly to the generate method
+    input_ids = tokenizer(final_prompt, return_tensors="pt").input_ids.to("cuda")
     
     with torch.no_grad():
-        outputs = llm_model.generate(**inputs, max_new_tokens=512)
+        outputs = llm_model.generate(input_ids=input_ids, max_new_tokens=512)
     
+    # We need to decode only the newly generated tokens, not the whole sequence
     response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
     answer_start_index = response_text.find("ANSWER:")
     if answer_start_index != -1:
         return response_text[answer_start_index + len("ANSWER:"):].strip()
