@@ -7,7 +7,10 @@ import uuid
 import nltk
 import io
 
-# --- CACHE AND NLTK SETUP ---
+# --- GPU AND CACHE SETUP ---
+# THE FIX: Force the app to only see and use GPU 1 (NVIDIA GeForce MX330).
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 # Set the cache directory to ensure models are downloaded to your E: drive.
 CACHE_DIR = "E:/huggingface_cache"
 os.environ["HF_HOME"] = CACHE_DIR
@@ -51,18 +54,21 @@ from config import (
 @st.cache_resource
 def load_models_and_clients():
     """Load all required models and database clients and cache them."""
-    print("Loading models and clients for CPU...")
+    print("Loading models and clients for GPU (TinyLlama)...")
     
-    # Load the embedding model onto the CPU
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
+    # --- THE FIX IS HERE ---
+    # We are switching back to 'cuda' for the embedding model.
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
     
     # Download the GGUF model file from Hugging Face Hub if it doesn't exist
     model_path = hf_hub_download(repo_id=LLM_MODEL_NAME, filename=LLM_MODEL_FILE)
 
-    # Load the GGUF model using ctransformers, configured to run on the CPU.
+    # Load the GGUF model using ctransformers, configured for GPU offloading.
+    # Because TinyLlama is small, we can try to offload more layers.
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        model_type="llama", # TinyLlama is based on the Llama architecture
+        model_type="llama",
+        gpu_layers=25,  # Offload 25 layers to the GPU. This is a good starting point.
         context_length=4096 
     )
     
@@ -202,7 +208,7 @@ QUESTION:
 # --- STREAMLIT UI SETUP ---
 
 st.set_page_config(page_title="Dynamic RAG Chatbot", layout="wide")
-st.title("📄 Dynamic Document Chatbot (CPU Version)")
+st.title("📄 Dynamic Document Chatbot (GPU Version)")
 
 try:
     embedding_model, llm_model, qdrant_client = load_models_and_clients()
@@ -239,7 +245,7 @@ if st.session_state.get("documents_processed", False):
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            with st.spinner("Finding an answer... (This may be slow on CPU)"):
+            with st.spinner("Finding an answer..."):
                 full_response = get_answer(prompt, embedding_model, llm_model, qdrant_client)
                 message_placeholder.markdown(full_response)
         st.session_state.messages.append({"role": "assistant", "content": full_response})
