@@ -7,12 +7,27 @@ import uuid
 import nltk
 import io
 
-# --- CACHE SETUP ---
+# --- CACHE AND NLTK SETUP ---
 # Set the cache directory to ensure models are downloaded to your E: drive.
 CACHE_DIR = "E:/huggingface_cache"
 os.environ["HF_HOME"] = CACHE_DIR
 os.environ["SENTENCE_TRANSFORMERS_HOME"] = CACHE_DIR
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+# We now handle the NLTK 'punkt' download robustly within the app itself.
+# 1. Define a local path for NLTK data.
+nltk_data_path = os.path.join(os.getcwd(), "nltk_data")
+# 2. Check if the 'punkt' tokenizer is available in our local path.
+punkt_tokenizer_path = os.path.join(nltk_data_path, "tokenizers", "punkt")
+# 3. If not, download it to our local path.
+if not os.path.exists(punkt_tokenizer_path):
+    print(f"Downloading NLTK 'punkt' model to {nltk_data_path}...")
+    os.makedirs(nltk_data_path, exist_ok=True)
+    nltk.download('punkt', download_dir=nltk_data_path)
+# 4. Add our local path to NLTK's search paths to ensure it's found.
+if nltk_data_path not in nltk.data.path:
+    nltk.data.path.insert(0, nltk_data_path)
+
 
 # --- ML/AI Library Imports ---
 from sentence_transformers import SentenceTransformer
@@ -45,15 +60,14 @@ def load_models_and_clients():
     model_path = hf_hub_download(repo_id=LLM_MODEL_NAME, filename=LLM_MODEL_FILE)
 
     # Load the GGUF model using ctransformers, configured to run on the CPU.
-    # The gpu_layers parameter is removed.
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        model_type="mistral",
+        model_type="llama", # TinyLlama is based on the Llama architecture
         context_length=4096 
     )
     
-    # Initialize the client to connect to our Qdrant database
-    qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    # We increase the timeout to 60 seconds to prevent timeout errors on slower systems.
+    qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=60)
     
     print("Models and clients loaded successfully.")
     return embedding_model, llm_model, qdrant_client
@@ -67,14 +81,14 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
         return
 
     with st.spinner("Processing documents... This may take a while."):
-        # --- THE FIX IS HERE ---
-        # This command is idempotent: it will only download the 'punkt' data
-        # if it's missing, otherwise it does nothing. This is more robust
-        # than the try/except block.
-        nltk.download('punkt')
-
-        # Clear the old collection in Qdrant to start fresh
-        qdrant_client.recreate_collection(
+        # We now use the modern, non-deprecated way to ensure a clean collection.
+        # First, check if the collection exists.
+        if qdrant_client.collection_exists(collection_name=QDRANT_COLLECTION_NAME):
+            # If it exists, delete it.
+            qdrant_client.delete_collection(collection_name=QDRANT_COLLECTION_NAME)
+        
+        # Now, create a new, empty collection.
+        qdrant_client.create_collection(
             collection_name=QDRANT_COLLECTION_NAME,
             vectors_config=models.VectorParams(
                 size=embedding_model.get_sentence_embedding_dimension(),
@@ -100,7 +114,8 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
                     doc = docx.Document(doc_stream)
                     text = "\n".join([para.text for para in doc.paragraphs])
 
-            # Chunking logic using NLTK
+            # We use the standard, high-level sent_tokenize function.
+            # Because we've set the path correctly, it will find the local data.
             sentences = nltk.sent_tokenize(text)
             current_chunk = ""
             for sentence in sentences:
@@ -160,7 +175,7 @@ def get_answer(query, embedding_model, llm_model, qdrant_client):
     if not context:
         return "Sorry, I could not find any relevant information in the documents."
 
-    # This prompt template is specifically for Mistral Instruct models
+    # This prompt template is specifically for TinyLlama Instruct models
     prompt_template = """
 <|system|>
 You are a helpful assistant. Your task is to answer the user's question based ONLY on the context provided below.

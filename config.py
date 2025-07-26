@@ -3,9 +3,10 @@
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # LLM Model Configuration
-# We are now using a GGUF model which is highly compatible and can offload layers to the GPU.
-LLM_MODEL_NAME = "TheBloke/Mistral-7B-Instruct-v0.2-GGUF"
-LLM_MODEL_FILE = "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+# THE FIX: We are prioritizing speed for a smooth demo experience on the CPU.
+# TinyLlama is the fastest viable option.
+LLM_MODEL_NAME = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
+LLM_MODEL_FILE = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 
 
 # Vector Database Configuration
