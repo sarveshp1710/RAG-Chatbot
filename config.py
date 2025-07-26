@@ -3,9 +3,10 @@
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # LLM Model Configuration
-# We are using the powerful Mistral-7B model in its GPTQ-quantized version.
-# This is designed to run efficiently on a GPU with ~16GB of VRAM.
-LLM_MODEL_NAME = "TheBloke/Mistral-7B-Instruct-v0.2-GPTQ"
+# We are now using a GGUF model which is highly compatible and can offload layers to the GPU.
+LLM_MODEL_NAME = "TheBloke/Mistral-7B-Instruct-v0.2-GGUF"
+LLM_MODEL_FILE = "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+
 
 # Vector Database Configuration
 # Settings for our local Qdrant instance running in Docker.

@@ -1,33 +1,30 @@
 import os
 import streamlit as st
 import torch
-# --- THE FIX IS HERE ---
-# We now import the specialized loader directly from the auto_gptq library
-from transformers import AutoTokenizer
-from auto_gptq import AutoGPTQForCausalLM
-from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient, models
 import fitz  # PyMuPDF
 import docx
 import uuid
 import nltk
 import io
 
-# --- CACHE DIRECTORY SETUP (THE FIX) ---
-# This is the most important step to ensure models are downloaded to your E: drive.
-# We set the environment variable programmatically before any other imports.
+# --- CACHE DIRECTORY SETUP ---
+# This ensures models are downloaded to your E: drive.
 CACHE_DIR = "E:/huggingface_cache"
 os.environ["HF_HOME"] = CACHE_DIR
 os.environ["SENTENCE_TRANSFORMERS_HOME"] = CACHE_DIR
-
-# Create the directory if it doesn't exist
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# --- ML/AI Library Imports ---
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient, models
+from ctransformers import AutoModelForCausalLM
+from huggingface_hub import hf_hub_download
 
 # Import configuration from our config.py file
 from config import (
     EMBEDDING_MODEL_NAME,
     LLM_MODEL_NAME,
+    LLM_MODEL_FILE,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
@@ -39,24 +36,30 @@ from config import (
 @st.cache_resource
 def load_models_and_clients():
     """Load all required models and database clients and cache them."""
-    print("Loading models and clients for GPU using AutoGPTQ...")
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, use_fast=True)
+    print("Loading models and clients for GPU (GGUF)...")
     
-    # --- THE FIX IS HERE ---
-    # We now use AutoGPTQForCausalLM.from_quantized, which is the specialized
-    # loader for GPTQ models. This is more reliable.
-    llm_model = AutoGPTQForCausalLM.from_quantized(
-        LLM_MODEL_NAME,
-        device="cuda:0", # Explicitly specify the GPU device
-        use_safetensors=True,
-        trust_remote_code=True,
-        use_triton=False # Triton is another optimization that can sometimes cause issues
+    # Load the embedding model, placing it on the GPU
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
+    
+    # Download the GGUF model file from Hugging Face Hub if it doesn't exist
+    model_path = hf_hub_download(repo_id=LLM_MODEL_NAME, filename=LLM_MODEL_FILE)
+
+    # Load the GGUF model using ctransformers, configured for GPU offloading
+    # The number of layers to offload depends on your VRAM. 50 is a high number
+    # suitable for GPUs with >12GB VRAM. If you get an out-of-memory error,
+    # reduce this number (e.g., to 20 or 30).
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        model_type="mistral",
+        gpu_layers=50,  # Offload 50 layers to the GPU
+        context_length=4096 
     )
     
+    # Initialize the client to connect to our Qdrant database
     qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    
     print("Models and clients loaded successfully.")
-    return embedding_model, tokenizer, llm_model, qdrant_client
+    return embedding_model, llm_model, qdrant_client
 
 # --- DOCUMENT PROCESSING LOGIC ---
 
@@ -143,7 +146,7 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
 
 # --- RAG AND CHAT LOGIC ---
 
-def get_answer(query, embedding_model, tokenizer, llm_model, qdrant_client):
+def get_answer(query, embedding_model, llm_model, qdrant_client):
     """Performs the RAG pipeline to get an answer for the user query."""
     query_vector = embedding_model.encode(query).tolist()
     search_results = qdrant_client.search(
@@ -160,50 +163,41 @@ def get_answer(query, embedding_model, tokenizer, llm_model, qdrant_client):
     if not context:
         return "Sorry, I could not find any relevant information in the documents."
 
+    # This prompt template is specifically for Mistral Instruct models
     prompt_template = """
-INSTRUCTION: You are a helpful assistant. Your task is to answer the user's question based ONLY on the context provided below.
+<|system|>
+You are a helpful assistant. Your task is to answer the user's question based ONLY on the context provided below.
 - If the context contains the answer, provide the answer.
 - After the answer, on a new line, cite the exact source using the format: SOURCE: [filename], Chunk ID: [chunk_id].
 - If you cannot find the answer, respond with "I could not find the answer in the provided documents."
-- Do not use any external knowledge.
-
+- Do not use any external knowledge.</s>
+<|user|>
 CONTEXT:
 {context}
 
 QUESTION:
-{query}
-
-ANSWER:
+{query}</s>
+<|assistant|>
 """
+    
     final_prompt = prompt_template.format(context=context, query=query)
-    # The AutoGPTQ model requires a different input format for generation
-    # We pass the tokenized prompt directly to the generate method
-    input_ids = tokenizer(final_prompt, return_tensors="pt").input_ids.to("cuda")
     
-    with torch.no_grad():
-        outputs = llm_model.generate(input_ids=input_ids, max_new_tokens=512)
+    # Generate the answer using the GGUF model
+    response = llm_model(final_prompt, max_new_tokens=512, temperature=0.1)
     
-    # We need to decode only the newly generated tokens, not the whole sequence
-    response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    answer_start_index = response_text.find("ANSWER:")
-    if answer_start_index != -1:
-        return response_text[answer_start_index + len("ANSWER:"):].strip()
-    return "Could not parse the model's response."
+    return response.strip()
 
 # --- STREAMLIT UI SETUP ---
 
 st.set_page_config(page_title="Dynamic RAG Chatbot", layout="wide")
-st.title("📄 Dynamic Document Chatbot")
+st.title("📄 Dynamic Document Chatbot (GPU Version)")
 
-# Load models and clients
 try:
-    embedding_model, tokenizer, llm_model, qdrant_client = load_models_and_clients()
+    embedding_model, llm_model, qdrant_client = load_models_and_clients()
 except Exception as e:
     st.error(f"Failed to load models: {e}")
     st.stop()
 
-# Sidebar for file upload
 with st.sidebar:
     st.header("1. Upload Documents")
     uploaded_files = st.file_uploader(
@@ -216,7 +210,6 @@ with st.sidebar:
             uploaded_files, qdrant_client, embedding_model
         )
 
-# Main chat interface
 st.header("2. Chat with Your Documents")
 
 if st.session_state.get("documents_processed", False):
@@ -235,7 +228,7 @@ if st.session_state.get("documents_processed", False):
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             with st.spinner("Finding an answer..."):
-                full_response = get_answer(prompt, embedding_model, tokenizer, llm_model, qdrant_client)
+                full_response = get_answer(prompt, embedding_model, llm_model, qdrant_client)
                 message_placeholder.markdown(full_response)
         st.session_state.messages.append({"role": "assistant", "content": full_response})
 else:
