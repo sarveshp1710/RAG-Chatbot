@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -8,6 +9,17 @@ import docx
 import uuid
 import nltk
 import io
+
+# --- CACHE DIRECTORY SETUP (THE FIX) ---
+# This is the most important step to ensure models are downloaded to your E: drive.
+# We set the environment variable programmatically before any other imports.
+CACHE_DIR = "E:/huggingface_cache"
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = CACHE_DIR
+
+# Create the directory if it doesn't exist
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 
 # Import configuration from our config.py file
 from config import (
