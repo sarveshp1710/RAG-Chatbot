@@ -50,8 +50,8 @@ Follow these steps to run the application on your local system.
 ### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/YourUsername/your-repo-name.git](https://github.com/YourUsername/your-repo-name.git)
-cd your-repo-name
+git clone https://github.com/sarveshp1710/RAG-Chatbot.git
+cd RAG-Chatbot
 ```
 
 ### 2. Set Up the Python Environment
