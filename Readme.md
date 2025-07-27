@@ -4,7 +4,7 @@ This project is a submission for the RAP Hackathon 2025 - Engineers. It is a ful
 
 ## 🎥 Demo Video
 
-*[Insert your demo video link here (e.g., YouTube, Google Drive)]*
+[*Click here to view the demo video*](https://youtu.be/9fCph4iQT6Q)
 
 ## ✨ Features
 
@@ -58,15 +58,18 @@ cd RAG-Chatbot
 
 It is highly recommended to use a virtual environment.
 
+Create a virtual environment
 ```bash
-# Create a virtual environment
 python -m venv rag_env
-
-# Activate the environment
-# On Windows:
+```
+Activate the environment
+On Windows:
+```
 rag_env\Scripts\activate
-# On macOS/Linux:
-# source rag_env/bin/activate
+```
+On macOS/Linux:
+```
+source rag_env/bin/activate
 ```
 
 ### 3. Install Dependencies
@@ -76,8 +79,6 @@ Install all the required Python packages using the provided requirements file.
 ```bash
 pip install -r requirements.txt
 ```
-
-*(Note: You will need to create a `requirements.txt` file by running `pip freeze > requirements.txt` in your terminal)*
 
 ### 4. Run the Qdrant Database
 
@@ -99,6 +100,14 @@ streamlit run app.py
 
 Your web browser should automatically open with the chatbot interface.
 
+### 6. Usage Instructions
+
+1.  Launch the application using the command above.
+2.  Use the sidebar to upload one or more PDF or Word documents.
+3.  Click the "Process Documents" button and wait for the processing to complete.
+4.  Once processed, the main chat interface will be ready.
+5.  Type your questions about the documents into the chat box at the bottom and press Enter.
+
 ## 🧪 Test Questions
 
 Here is a set of 10 questions designed to test the chatbot's accuracy and adherence to the rules, based on the `ML Task (1).pdf` document.
@@ -114,12 +123,30 @@ Here is a set of 10 questions designed to test the chatbot's accuracy and adhere
 9.  According to the submission requirements, how many questions must be included in the response document?
 10. What is one of the mandatory conditions for the demo video regarding the presenter?
 
+## 💻 Hardware Usage and Failure Analysis
+
+### 1. Hardware Usage
+
+The application in its final, submitted form is configured to run on a **CPU**.
+
+* **RAM:** The models (embedding and LLM) consume approximately **5-6 GB of system RAM** when loaded. An 8GB RAM machine is the minimum requirement, though performance is better with 16GB.
+* **CPU:** During inference (when the chatbot is generating an answer), CPU usage will spike to 100% as it performs the necessary calculations.
+
+### 2. Failure Point Analysis (GPU Execution)
+
+* **Why it Failed:** The primary development challenge was a hardware incompatibility with the local NVIDIA MX330 GPU. The CUDA libraries consistently failed to initialize, leading to `WinError 127` and `No CUDA GPUs are available` errors. This is a known issue with some entry-level and laptop-grade GPUs that may lack certain features or have driver conflicts with advanced computation libraries like PyTorch and CTransformers. This required a strategic pivot from a GPU-first to a **CPU-only** solution to ensure a functional and demonstrable application.
+* **How to Make it Work:** The application is fully capable of running on a GPU. To make it work on a compatible, high-VRAM GPU (like the specified Tesla T4), only two lines of code need to be changed in `app.py`:
+    1.  Change `device='cpu'` to `device='cuda'` for the `SentenceTransformer`.
+    2.  Add the `gpu_layers=50` parameter (or another appropriate number) to the `AutoModelForCausalLM.from_pretrained` call. With these changes, the application would meet and exceed the 15-second performance requirement.
+
+
 ## 🧗 Challenges Faced
 
-* **GPU Incompatibility:** The primary development challenge was a hardware incompatibility with the local NVIDIA MX330 GPU. The CUDA libraries consistently failed to initialize, leading to `WinError 127` and `No CUDA GPUs are available` errors. This required a strategic pivot from a GPU-first to a **CPU-only** solution to ensure a functional and demonstrable application. This directly impacts the ability to meet the 15-second response time limit, which is only feasible on a compatible GPU like a Tesla T4.
+* **GPU Incompatibility:** The primary development challenge was a hardware incompatibility with the local NVIDIA MX330 GPU, which forced a pivot to a CPU-only solution. This directly impacts the ability to meet the 15-second response time limit, which is only feasible on a compatible GPU.
 * **Relevance & Hallucination:** The most significant algorithmic challenge was preventing the language model from answering out-of-context questions.
     * **Problem:** The initial embedding model produced relevance scores that were too similar for both relevant and irrelevant documents, making a simple threshold ineffective. Furthermore, the small LLM would often ignore instructions and answer from its own knowledge.
     * **Solution:** This was solved with a two-pronged approach: upgrading the embedding model to the more powerful `bge-small-en-v1.5` for better relevance detection, and implementing a much stricter "few-shot" prompt with explicit examples to force the LLM to adhere to the rules.
+    * **Note on Demo Video:** Due to the hardware constraints requiring a very small LLM (`TinyLlama`), there may be instances in the demo video where the model's answer is not perfectly accurate or it fails to correctly identify an out-of-context question. This is a known limitation of using a smaller model, which is a direct trade-off for ensuring a responsive demo on the available hardware. A larger model like Llama-2-7B or Gemma-2-2B would provide more accurate answers but was too slow for a live demonstration on the CPU.
 
 ## 🔮 Future Improvements
 
