@@ -7,6 +7,7 @@ import uuid
 import nltk
 import io
 import psutil # Import psutil for system monitoring
+import time # Import time to measure response duration
 
 # --- CACHE AND NLTK SETUP ---
 # Set the cache directory to ensure models are downloaded to your E: drive.
@@ -63,7 +64,7 @@ def load_models_and_clients():
     # Load the GGUF model using ctransformers, configured to run on the CPU.
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        model_type="llama", # TinyLlama is based on the Llama architecture
+        model_type="llama", # Set model type for TinyLlama
         context_length=4096 
     )
     
@@ -109,31 +110,42 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
             text = ""
             if file_name.endswith(".pdf"):
                 with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-                    text = "".join(page.get_text() for page in doc)
+                    for page_num, page in enumerate(doc):
+                        # We now store page number in the metadata for each chunk
+                        sentences = nltk.sent_tokenize(page.get_text())
+                        current_chunk = ""
+                        for sentence in sentences:
+                            if len(current_chunk) + len(sentence) + 1 <= CHUNK_SIZE:
+                                current_chunk += " " + sentence
+                            else:
+                                if current_chunk:
+                                    all_chunks_text.append(current_chunk.strip())
+                                    all_chunks_meta.append({"file_name": file_name, "page_number": page_num + 1})
+                                current_chunk = sentence
+                        if current_chunk:
+                            all_chunks_text.append(current_chunk.strip())
+                            all_chunks_meta.append({"file_name": file_name, "page_number": page_num + 1})
             elif file_name.endswith(".docx"):
                 with io.BytesIO(file_bytes) as doc_stream:
                     doc = docx.Document(doc_stream)
-                    text = "\n".join([para.text for para in doc.paragraphs])
-
-            # We use the standard, high-level sent_tokenize function.
-            # Because we've set the path correctly, it will find the local data.
-            sentences = nltk.sent_tokenize(text)
-            current_chunk = ""
-            for sentence in sentences:
-                if len(current_chunk) + len(sentence) + 1 <= CHUNK_SIZE:
-                    current_chunk += " " + sentence
-                else:
+                    full_text = "\n".join([para.text for para in doc.paragraphs])
+                    sentences = nltk.sent_tokenize(full_text)
+                    current_chunk = ""
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) + 1 <= CHUNK_SIZE:
+                            current_chunk += " " + sentence
+                        else:
+                            if current_chunk:
+                                all_chunks_text.append(current_chunk.strip())
+                                all_chunks_meta.append({"file_name": file_name, "page_number": 1})
+                            current_chunk = sentence
                     if current_chunk:
                         all_chunks_text.append(current_chunk.strip())
-                        all_chunks_meta.append({"file_name": file_name})
-                    current_chunk = sentence
-            if current_chunk:
-                all_chunks_text.append(current_chunk.strip())
-                all_chunks_meta.append({"file_name": file_name})
+                        all_chunks_meta.append({"file_name": file_name, "page_number": 1})
+
 
         st.write(f"Created {len(all_chunks_text)} chunks. Now embedding...")
 
-        # --- THE FIX IS HERE ---
         # The BGE embedding model performs best when you add a specific instruction
         # to the text before embedding it. This significantly improves relevance detection.
         prefixed_chunks = [f"Represent this document for retrieval: {chunk}" for chunk in all_chunks_text]
@@ -152,7 +164,8 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
                     payload={
                         "file_name": meta["file_name"],
                         "content": text_chunk, # We store the original, non-prefixed text
-                        "chunk_id": chunk_id
+                        "chunk_id": chunk_id,
+                        "page_number": meta.get("page_number", 1) # Store page number
                     }
                 )
                 for chunk_id, vector, text_chunk, meta in zip(chunk_ids, chunk_embeddings, all_chunks_text, all_chunks_meta)
@@ -166,6 +179,8 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
 
 def get_answer(query, embedding_model, llm_model, qdrant_client):
     """Performs the RAG pipeline to get an answer for the user query."""
+    start_time = time.time() # Start the timer
+
     # Note: For the BGE model, you do NOT add a prefix to the user's query.
     # This is called "asymmetric" search and is the recommended approach.
     query_vector = embedding_model.encode(query).tolist()
@@ -179,33 +194,37 @@ def get_answer(query, embedding_model, llm_model, qdrant_client):
     if search_results:
         st.session_state.scores = [result.score for result in search_results]
     else:
-        return "I could not find any relevant information in the provided documents."
+        return "I could not find any relevant information in the provided documents.", 0, []
 
-    # --- THE FIRST FIX IS HERE ---
     # With the better embedding model, we can use a more reliable and stricter threshold.
     relevance_threshold = 0.4
     if search_results[0].score < relevance_threshold:
-        return "I could not find any relevant information in the provided documents."
+        return "I could not find any relevant information in the provided documents.", time.time() - start_time, []
 
     
     context = ""
+    sources = []
     for result in search_results:
         if result.score >= relevance_threshold:
-            context += f"Source: {result.payload['file_name']}\n"
             context += f"Content: {result.payload['content']}\n---\n"
+            sources.append({
+                "file_name": result.payload['file_name'],
+                "page_number": result.payload.get('page_number', 'N/A'),
+                "chunk_id": result.payload['chunk_id']
+            })
         
     if not context:
-        return "I could not find any relevant information in the provided documents."
+        return "I could not find any relevant information in the provided documents.", time.time() - start_time, []
 
-    # --- THE SECOND FIX IS HERE ---
     # A much stronger, more explicit prompt to force the model to obey.
+    # This prompt format is specific to TinyLlama Chat.
     prompt_template = """
 <|system|>
-ROLE: You are a document analysis assistant.
-TASK: Analyze the CONTEXT below and answer the QUESTION based ONLY on the information within the CONTEXT.
-RULE 1: If the CONTEXT contains the answer, provide a direct answer and the source.
-RULE 2: If the CONTEXT does NOT contain the answer, you MUST reply with the exact words: "I could not find the answer in the provided documents."
-RULE 3: Do NOT use any information from outside the CONTEXT. This is a strict rule.</s>
+You are a specialized AI assistant. You must follow these instructions exactly.
+Your task is to answer a question based only on the provided context.
+If the context contains the answer, you will state the answer and its source.
+If the context does NOT contain the answer, you MUST reply with the exact phrase: "I could not find the answer in the provided documents."
+
 <|user|>
 CONTEXT:
 {context}
@@ -220,7 +239,10 @@ QUESTION:
     # We set temperature to 0.0 to make the model more deterministic and less creative.
     response = llm_model(final_prompt, max_new_tokens=512, temperature=0.0)
     
-    return response.strip()
+    end_time = time.time() # End the timer
+    duration = end_time - start_time
+    
+    return response.strip(), duration, sources
 
 # --- STREAMLIT UI SETUP ---
 
@@ -268,7 +290,7 @@ with st.sidebar:
         st.subheader("Optimization Strategies Implemented")
         st.markdown("""
         - **Execution Mode:** This app is running in **CPU-only mode** due to local hardware constraints preventing stable GPU initialization. On a target system like a Tesla T4, the `gpu_layers` parameter would be set to offload computation for a >100x speed increase.
-        - **CPU-Centric Model:** Switched to `TinyLlama-1.1B-GGUF`, a quantized model optimized for CPU inference, to ensure functionality and reasonable speed.
+        - **CPU-Centric Model:** Switched back to `TinyLlama-1.1B-GGUF`, a quantized model optimized for CPU inference, to ensure a responsive demo.
         - **Efficient Model Caching:** Implemented `@st.cache_resource` to load the AI models into memory only once per session, preventing slow reloads on every interaction.
         - **Local Caching:** All models are downloaded to a local cache on the E: drive, avoiding re-downloads and saving internet bandwidth.
         - **Relevance Thresholding:** A programmatic check ensures the LLM is only queried if the retrieved documents have a high relevance score, saving computational resources on irrelevant questions.
@@ -298,7 +320,25 @@ if st.session_state.get("documents_processed", False):
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             with st.spinner("Finding an answer... (This may be slow on CPU)"):
-                full_response = get_answer(prompt, embedding_model, llm_model, qdrant_client)
+                answer, duration, sources = get_answer(prompt, embedding_model, llm_model, qdrant_client)
+                
+                # We now construct the final response string with the time and sources.
+                if sources and "I could not find the answer" not in answer:
+                    # Create a unique list of sources to avoid repetition
+                    unique_sources = []
+                    seen_sources = set()
+                    for src in sources:
+                        source_id = f"{src['file_name']}_p{src['page_number']}"
+                        if source_id not in seen_sources:
+                            unique_sources.append(src)
+                            seen_sources.add(source_id)
+                    
+                    source_str = ", ".join([f"'{s['file_name']}' (page {s['page_number']})" for s in unique_sources])
+                    
+                    full_response = f"{answer}\n\n*Answered in {duration:.2f} seconds from {source_str}*"
+                else:
+                    full_response = f"{answer}\n\n*Answered in {duration:.2f} seconds*"
+
                 message_placeholder.markdown(full_response)
         st.session_state.messages.append({"role": "assistant", "content": full_response})
 else:
