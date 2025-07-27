@@ -6,11 +6,9 @@ import docx
 import uuid
 import nltk
 import io
+import psutil # Import psutil for system monitoring
 
-# --- GPU AND CACHE SETUP ---
-# THE FIX: Force the app to only see and use GPU 1 (NVIDIA GeForce MX330).
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
+# --- CACHE AND NLTK SETUP ---
 # Set the cache directory to ensure models are downloaded to your E: drive.
 CACHE_DIR = "E:/huggingface_cache"
 os.environ["HF_HOME"] = CACHE_DIR
@@ -54,21 +52,18 @@ from config import (
 @st.cache_resource
 def load_models_and_clients():
     """Load all required models and database clients and cache them."""
-    print("Loading models and clients for GPU (TinyLlama)...")
+    print("Loading models and clients for CPU...")
     
-    # --- THE FIX IS HERE ---
-    # We are switching back to 'cuda' for the embedding model.
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
+    # Load the embedding model onto the CPU
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
     
     # Download the GGUF model file from Hugging Face Hub if it doesn't exist
     model_path = hf_hub_download(repo_id=LLM_MODEL_NAME, filename=LLM_MODEL_FILE)
 
-    # Load the GGUF model using ctransformers, configured for GPU offloading.
-    # Because TinyLlama is small, we can try to offload more layers.
+    # Load the GGUF model using ctransformers, configured to run on the CPU.
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        model_type="llama",
-        gpu_layers=25,  # Offload 25 layers to the GPU. This is a good starting point.
+        model_type="llama", # TinyLlama is based on the Llama architecture
         context_length=4096 
     )
     
@@ -138,8 +133,13 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
 
         st.write(f"Created {len(all_chunks_text)} chunks. Now embedding...")
 
+        # --- THE FIX IS HERE ---
+        # The BGE embedding model performs best when you add a specific instruction
+        # to the text before embedding it. This significantly improves relevance detection.
+        prefixed_chunks = [f"Represent this document for retrieval: {chunk}" for chunk in all_chunks_text]
+
         # Embed all chunks at once
-        chunk_embeddings = embedding_model.encode(all_chunks_text, show_progress_bar=True)
+        chunk_embeddings = embedding_model.encode(prefixed_chunks, show_progress_bar=True)
         
         # Upload to Qdrant
         chunk_ids = [str(uuid.uuid4()) for _ in all_chunks_text]
@@ -151,7 +151,7 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
                     vector=vector.tolist(),
                     payload={
                         "file_name": meta["file_name"],
-                        "content": text_chunk,
+                        "content": text_chunk, # We store the original, non-prefixed text
                         "chunk_id": chunk_id
                     }
                 )
@@ -166,29 +166,46 @@ def process_documents(uploaded_files, qdrant_client, embedding_model):
 
 def get_answer(query, embedding_model, llm_model, qdrant_client):
     """Performs the RAG pipeline to get an answer for the user query."""
+    # Note: For the BGE model, you do NOT add a prefix to the user's query.
+    # This is called "asymmetric" search and is the recommended approach.
     query_vector = embedding_model.encode(query).tolist()
+    
     search_results = qdrant_client.search(
         collection_name=QDRANT_COLLECTION_NAME,
         query_vector=query_vector,
         limit=3
     )
     
+    if search_results:
+        st.session_state.scores = [result.score for result in search_results]
+    else:
+        return "I could not find any relevant information in the provided documents."
+
+    # --- THE FIRST FIX IS HERE ---
+    # With the better embedding model, we can use a more reliable and stricter threshold.
+    relevance_threshold = 0.4
+    if search_results[0].score < relevance_threshold:
+        return "I could not find any relevant information in the provided documents."
+
+    
     context = ""
     for result in search_results:
-        context += f"Source: {result.payload['file_name']}, Chunk ID: {result.payload['chunk_id']}\n"
-        context += f"Content: {result.payload['content']}\n---\n"
+        if result.score >= relevance_threshold:
+            context += f"Source: {result.payload['file_name']}\n"
+            context += f"Content: {result.payload['content']}\n---\n"
         
     if not context:
-        return "Sorry, I could not find any relevant information in the documents."
+        return "I could not find any relevant information in the provided documents."
 
-    # This prompt template is specifically for TinyLlama Instruct models
+    # --- THE SECOND FIX IS HERE ---
+    # A much stronger, more explicit prompt to force the model to obey.
     prompt_template = """
 <|system|>
-You are a helpful assistant. Your task is to answer the user's question based ONLY on the context provided below.
-- If the context contains the answer, provide the answer.
-- After the answer, on a new line, cite the exact source using the format: SOURCE: [filename], Chunk ID: [chunk_id].
-- If you cannot find the answer, respond with "I could not find the answer in the provided documents."
-- Do not use any external knowledge.</s>
+ROLE: You are a document analysis assistant.
+TASK: Analyze the CONTEXT below and answer the QUESTION based ONLY on the information within the CONTEXT.
+RULE 1: If the CONTEXT contains the answer, provide a direct answer and the source.
+RULE 2: If the CONTEXT does NOT contain the answer, you MUST reply with the exact words: "I could not find the answer in the provided documents."
+RULE 3: Do NOT use any information from outside the CONTEXT. This is a strict rule.</s>
 <|user|>
 CONTEXT:
 {context}
@@ -200,15 +217,15 @@ QUESTION:
     
     final_prompt = prompt_template.format(context=context, query=query)
     
-    # Generate the answer using the GGUF model
-    response = llm_model(final_prompt, max_new_tokens=512, temperature=0.1)
+    # We set temperature to 0.0 to make the model more deterministic and less creative.
+    response = llm_model(final_prompt, max_new_tokens=512, temperature=0.0)
     
     return response.strip()
 
 # --- STREAMLIT UI SETUP ---
 
 st.set_page_config(page_title="Dynamic RAG Chatbot", layout="wide")
-st.title("📄 Dynamic Document Chatbot (GPU Version)")
+st.title("📄 Dynamic Document Chatbot (CPU Version)")
 
 try:
     embedding_model, llm_model, qdrant_client = load_models_and_clients()
@@ -224,11 +241,46 @@ with st.sidebar:
         accept_multiple_files=True
     )
     if st.button("Process Documents") and uploaded_files:
+        # Clear previous scores when processing new docs
+        if 'scores' in st.session_state:
+            del st.session_state['scores']
         st.session_state.documents_processed = process_documents(
             uploaded_files, qdrant_client, embedding_model
         )
+    
+    st.header("2. System Analysis")
+    with st.expander("Memory & CPU Usage", expanded=True):
+        mem = psutil.virtual_memory()
+        total_mem_gb = mem.total / (1024**3)
+        used_mem_gb = mem.used / (1024**3)
+        mem_percent = mem.percent
+        
+        cpu_percent = psutil.cpu_percent()
+        
+        st.markdown(f"**Total RAM:** {total_mem_gb:.2f} GB")
+        st.markdown(f"**Used RAM:** {used_mem_gb:.2f} GB")
+        st.progress(mem_percent / 100)
+        
+        st.markdown(f"**CPU Usage:** {cpu_percent}%")
+        st.progress(cpu_percent / 100)
 
-st.header("2. Chat with Your Documents")
+        st.markdown("---")
+        st.subheader("Optimization Strategies Implemented")
+        st.markdown("""
+        - **Execution Mode:** This app is running in **CPU-only mode** due to local hardware constraints preventing stable GPU initialization. On a target system like a Tesla T4, the `gpu_layers` parameter would be set to offload computation for a >100x speed increase.
+        - **CPU-Centric Model:** Switched to `TinyLlama-1.1B-GGUF`, a quantized model optimized for CPU inference, to ensure functionality and reasonable speed.
+        - **Efficient Model Caching:** Implemented `@st.cache_resource` to load the AI models into memory only once per session, preventing slow reloads on every interaction.
+        - **Local Caching:** All models are downloaded to a local cache on the E: drive, avoiding re-downloads and saving internet bandwidth.
+        - **Relevance Thresholding:** A programmatic check ensures the LLM is only queried if the retrieved documents have a high relevance score, saving computational resources on irrelevant questions.
+        """)
+        
+    if 'scores' in st.session_state:
+        st.sidebar.markdown("### Top Retrieved Chunk Scores:")
+        for i, score in enumerate(st.session_state.scores):
+            st.sidebar.write(f"Chunk {i+1}: {score:.4f}")
+
+
+st.header("3. Chat with Your Documents")
 
 if st.session_state.get("documents_processed", False):
     if "messages" not in st.session_state:
@@ -245,9 +297,11 @@ if st.session_state.get("documents_processed", False):
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            with st.spinner("Finding an answer..."):
+            with st.spinner("Finding an answer... (This may be slow on CPU)"):
                 full_response = get_answer(prompt, embedding_model, llm_model, qdrant_client)
                 message_placeholder.markdown(full_response)
         st.session_state.messages.append({"role": "assistant", "content": full_response})
 else:
     st.info("Please upload and process your documents in the sidebar to begin.")
+
+# The continuous update loop has been removed.

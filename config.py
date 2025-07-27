@@ -1,10 +1,9 @@
 # Embedding Model Configuration
-# This is a small, fast, and high-quality model for creating vector embeddings.
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+# THE FIX: We are upgrading to a more powerful embedding model for better relevance detection.
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 # LLM Model Configuration
-# THE FIX: We are prioritizing speed for a smooth demo experience on the CPU.
-# TinyLlama is the fastest viable option.
+# We are staying with TinyLlama for speed, which is critical for the demo.
 LLM_MODEL_NAME = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
 LLM_MODEL_FILE = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 
