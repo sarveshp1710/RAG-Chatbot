@@ -16,4 +16,4 @@ QDRANT_COLLECTION_NAME = "hackathon_collection"
 
 # Chunking Configuration
 # The target size for our text chunks in characters.
-CHUNK_SIZE = 1000
+CHUNK_SIZE = 350
