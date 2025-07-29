@@ -1,10 +1,9 @@
 # Embedding Model Configuration
-# We are using a powerful embedding model for the best relevance detection.
-EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+# THE FIX: We are upgrading to a more powerful embedding model for the best relevance detection.
+EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
 
 # LLM Model Configuration
-# THE FIX: We are reverting to TinyLlama. It is the fastest model that can
-# still follow instructions reasonably well, making it the best choice for a responsive demo.
+# We are staying with TinyLlama for speed, which is critical for the demo.
 LLM_MODEL_NAME = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
 LLM_MODEL_FILE = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 
